@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Clinical Emotion & Blink Tracker</title>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/vision_bundle.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    :root { --bg: #0a0a0c; --card: #16161a; --accent: #3d5afe; --text: #e1e1e6; }
+    body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text); margin: 0; display: flex; flex-direction: column; align-items: center; }
+    #app-container { width: 100%; max-width: 800px; padding: 20px; text-align: center; }
+    .hidden { display: none !important; }
+    
+    /* Live UI */
+    #video-wrapper { position: relative; border-radius: 16px; overflow: hidden; box-shadow: 0 20px 50px rgba(0,0,0,0.5); }
+    video { width: 100%; height: auto; background: #000; transform: scaleX(-1); }
+    #live-stats { display: flex; justify-content: space-around; background: var(--card); margin-top: -5px; padding: 15px; border-bottom-left-radius: 16px; border-bottom-right-radius: 16px; border: 1px solid #2e2e33; }
+    .stat-val { font-size: 1.4rem; font-weight: 800; color: var(--accent); display: block; }
+    
+    /* Controls */
+    .controls { margin-top: 25px; display: flex; gap: 10px; justify-content: center; }
+    .btn { padding: 12px 24px; border-radius: 8px; border: none; font-weight: 600; cursor: pointer; transition: 0.3s; }
+    .btn-stop { background: #ff5252; color: white; }
+    .btn-report { background: var(--accent); color: white; }
+    
+    /* Report Page */
+    #report-page { background: var(--card); padding: 30px; border-radius: 16px; margin-top: 20px; text-align: left; }
+    .clinical-box { background: #1c1c21; padding: 20px; border-left: 4px solid var(--accent); border-radius: 4px; margin-top: 20px; line-height: 1.6; }
+    canvas { margin-top: 20px; max-height: 300px; }
+  </style>
+</head>
+<body>
+
+<div id="app-container">
+  <div id="test-view">
+    <h2>Live Accuracy Testing</h2>
+    <div id="video-wrapper">
+      <video id="webcam" autoplay playsinline></video>
+    </div>
+    <div id="live-stats">
+      <div><span class="label">Mood</span><span id="mood" class="stat-val">---</span></div>
+      <div><span class="label">Blinks</span><span id="blinks" class="stat-val">0</span></div>
+      <div><span class="label">Attention</span><span id="attn" class="stat-val">---</span></div>
+    </div>
+    
+    <div class="controls">
+      <div style="background:var(--card); padding:10px; border-radius:8px;">
+        <span>AI Accurate? </span>
+        <input type="radio" name="acc" value="yes" id="ry"><label for="ry">Yes</label>
+        <input type="radio" name="acc" value="no" id="rn"><label for="rn">No</label>
+      </div>
+      <button class="btn btn-stop" onclick="stopAnalysis()">End Testing</button>
+    </div>
+  </div>
+
+  <div id="report-view" class="hidden">
+    <h1>Session Report</h1>
+    <canvas id="moodChart"></canvas>
+    
+    <div class="clinical-box">
+      <h3>Clinical Diagnostic Summary</h3>
+      <p id="summary-text">Analyzing session data...</p>
+      <hr style="border:0; border-top:1px solid #333">
+      <p id="accuracy-stat" style="font-size:0.9rem; color:#888"></p>
+    </div>
+    
+    <button class="btn btn-report" onclick="location.reload()">New Test</button>
+  </div>
+</div>
+
+<script type="module">
+  import { FaceLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/vision_bundle.js";
+
+  const video = document.getElementById('webcam');
+  let faceLandmarker, blinks = 0, blinkActive = false, isRunning = true;
+  let sessionMoods = [], feedbackCount = {yes: 0, no: 0};
+  let baselines = {}, calibrationFrames = [];
+
+  async function init() {
+    const vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/wasm");
+    faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+      baseOptions: { modelAssetPath: `https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task` },
+      outputFaceBlendshapes: true, runningMode: "VIDEO", numFaces: 1
+    });
+    const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+    video.srcObject = stream;
+    video.addEventListener('loadeddata', predict);
+  }
+
+  async function predict() {
+    if(!isRunning) return;
+    const result = faceLandmarker.detectForVideo(video, performance.now());
+
+    if (result.faceBlendshapes?.[0]) {
+      const s = {};
+      result.faceBlendshapes[0].categories.forEach(c => s[c.categoryName] = c.score);
+
+      // 10-Frame Instant Calibration
+      if (calibrationFrames.length < 10) {
+        calibrationFrames.push(s);
+        if(calibrationFrames.length === 10) {
+            Object.keys(s).forEach(k => baselines[k] = calibrationFrames.reduce((a,b)=>a+b[k],0)/10);
+        }
+      } else {
+        const getRel = (n) => Math.max(0, (s[n] || 0) - (baselines[n] || 0));
+        
+        // Emotion Logic
+        const joy = getRel('mouthSmileLeft') * 1.6;
+        const sad = (getRel('browInnerUp') + getRel('frownLeft')) * 1.1;
+        const angry = (getRel('browDownLeft') + getRel('browDownRight')) * 1.8;
+        
+        let scores = { "Happy": joy, "Sad": sad, "Angry": angry, "Normal": 0.18 };
+        let mood = Object.keys(scores).reduce((a, b) => scores[a] > scores[b] ? a : b);
+        if (mood === "Sad" && scores["Sad"] < 0.25) mood = "Normal";
+
+        // Blink Sync (Rapid Detection)
+        const eyeClose = Math.max(s['eyeBlinkLeft'], s['eyeBlinkRight']);
+        if (eyeClose > 0.45 && !blinkActive) { blinks++; blinkActive = true; } 
+        else if (eyeClose < 0.25) { blinkActive = false; }
+
+        // Update Live Dashboard
+        document.getElementById('mood').innerText = mood;
+        document.getElementById('blinks').innerText = blinks;
+        document.getElementById('attn').innerText = s['eyeLookInLeft'] < 0.35 ? "FOCUSED" : "DISTRACTED";
+        sessionMoods.push(mood);
+
+        // Capture feedback
+        if(document.getElementById('ry').checked) { feedbackCount.yes++; document.getElementById('ry').checked = false; }
+        if(document.getElementById('rn').checked) { feedbackCount.no++; document.getElementById('rn').checked = false; }
+      }
+    }
+    requestAnimationFrame(predict);
+  }
+
+  window.stopAnalysis = () => {
+    isRunning = false;
+    document.getElementById('test-view').classList.add('hidden');
+    document.getElementById('report-view').classList.remove('hidden');
+    generateReport();
+  };
+
+  function generateReport() {
+    const counts = sessionMoods.reduce((a,b) => (a[b] = (a[b]||0) + 1, a), {});
+    const dominant = Object.keys(counts).reduce((a,b) => counts[a] > counts[b] ? a : b);
+    
+    // Chart
+    new Chart(document.getElementById('moodChart'), {
+      type: 'bar',
+      data: {
+        labels: Object.keys(counts),
+        datasets: [{ label: 'Time Spent (Frames)', data: Object.values(counts), backgroundColor: '#3d5afe' }]
+      }
+    });
+
+    // Clinical Logic
+    const insights = {
+      "Normal": "Patient exhibits a stable baseline. Emotional regulation is within expected clinical parameters.",
+      "Happy": "Elevated mood observed. High resilience markers and positive cognitive engagement.",
+      "Sad": "Markers of withdrawal and low affect detected. Recommend monitoring for persistent depressive patterns.",
+      "Angry": "Increased physiological tension in the corrugator muscles. Indicates acute stress or frustration."
+    };
+    
+    document.getElementById('summary-text').innerText = insights[dominant] || insights["Normal"];
+    const totalFeedback = feedbackCount.yes + feedbackCount.no;
+    const accuracy = totalFeedback > 0 ? Math.round((feedbackCount.yes / totalFeedback) * 100) : "N/A";
+    document.getElementById('accuracy-stat').innerText = `User-Reported Accuracy: ${accuracy}% (${feedbackCount.yes}/${totalFeedback})`;
+  }
+
+  init();
+</script>
+</body>
+</html>
